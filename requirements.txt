@@ -1,0 +1,6 @@
+# torch/torchvision: install the CUDA build separately (see README), not from PyPI's default wheel.
+torch
+torchvision
+numpy
+matplotlib
+tiktoken
