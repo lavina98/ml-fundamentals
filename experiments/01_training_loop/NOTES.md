@@ -4,7 +4,7 @@
 
 ## Tasks
 - [x] `gradient_descent.py`: fit a line with manual gradients, autograd, and nn+optim; learning-rate sweep
-- [ ] `train.py`: small network on FashionMNIST with train/val split; log train and val loss each epoch; save a checkpoint
+- [x] `train.py`: small network on FashionMNIST with train/val split; log train and val loss each epoch; save a checkpoint
 - [ ] `infer.py`: load the checkpoint, `model.eval()` + `torch.no_grad()`, predict on a few images, report accuracy and ms/batch
 - [ ] Overfitting: train on 1k samples with no regularization and plot the train/val gap; fix it with dropout or weight decay and plot again
 - [ ] GPU vs CPU time per epoch
@@ -50,3 +50,48 @@ Fit `y = 3x + 2 + noise` (200 points, x ∈ [−5, 5], noise std 0.5), starting 
 - **Removed `loss.backward()`:** the loss stayed constant. With no backward pass, `.grad` stays `None`, and the optimizer skips parameters without gradients, so `step()` silently does nothing.
 
 **Takeaway:** the worst training bugs don't crash. Two of the three bugs here failed silently, so always watch the loss curve.
+
+## Day 2: FashionMNIST MLP (`train.py`)
+
+Setup: 50k train / 10k val, batch size 64, `Flatten → Linear(784,256) → ReLU → Linear(256,10)`, `CrossEntropyLoss`, Adam lr=1e-3, 10 epochs on the RTX 3050.
+
+![train vs val loss](train_val_loss.png)
+
+### Model size
+- **Parameter count: 203,530**
+- Breakdown (a Linear layer has `in × out` weights + `out` biases; Flatten and ReLU have none):
+
+  | Layer | Weights | Biases | Total |
+  |---|---|---|---|
+  | Linear(784 → 256) | 784 × 256 = 200,704 | 256 | 200,960 |
+  | Linear(256 → 10) | 256 × 10 = 2,560 | 10 | 2,570 |
+  | **Total** | | | **203,530** |
+
+- **The first layer holds 98.7% of the parameters.** It connects every one of the 784 input pixels to each of the 256 hidden units, so its size is the input size times the hidden size. The output layer only maps 256 → 10. The same pattern shows up in transformers: embedding and projection layers scale with vocabulary size × hidden size.
+
+### Results
+| | Epoch 1 | Epoch 10 |
+|---|---|---|
+| Train loss |  0.5396 | 0.2376 |
+| Val loss | 0.4180 | 0.2925 |
+| Val accuracy | 84.84% | 89.11% |
+
+- Seconds per epoch (GPU): ~4s
+
+### What the curves show
+- **Not overfitting yet, but it's starting.** Val loss is still at its lowest at epoch 10 (0.2925), so more training hasn't hurt yet. But the curves crossed at epoch 3, and since then train loss keeps falling (0.35 → 0.24) while val flattens around 0.30. The train/val gap grows from ~0 to 0.055. That widening gap is the early sign; with 20–30 epochs val loss would start rising.
+- **Why val loss was lower than train loss in epoch 1:** they're measured at different times. Train loss is the *average over the epoch*, so it includes the terrible loss from the first batches when the weights were random. Val loss is measured *once, at the end* of the epoch, after all 782 updates. The model being evaluated on val is simply better than the average model seen during training.
+- **The bump at epoch 9** (val 0.30 → 0.32, then back to 0.29 at epoch 10) is **noise**, not a trend. A single-epoch spike that recovers comes from how that epoch's shuffled batches moved the weights. A trend would be val rising for several epochs in a row.
+
+### Concepts
+- **`model.train()` / `model.eval()`** set a mode flag that changes how certain layers *behave*: **Dropout** drops neurons only in train mode, and **BatchNorm** uses batch statistics in train mode but saved running averages in eval mode. They don't turn gradients on or off. This model has neither layer, so `eval()` changes nothing here yet; it will matter on Day 3 with dropout.
+- **`torch.no_grad()`** stops autograd from *recording the computation graph*. It doesn't prevent weight updates by itself; weights only change when `opt.step()` runs, and evaluation never calls it. What it does is save memory and time, because no intermediate activations are stored for a backward pass.
+- **Why evaluation uses both:** they do different jobs. `eval()` makes layers behave deterministically for prediction; `no_grad()` skips graph-building for speed and memory. Using only `no_grad()` would still apply dropout at eval, giving noisy, worse predictions. Using only `eval()` would waste memory building graphs nobody uses.
+- **Why no softmax in the model:** `CrossEntropyLoss` expects raw **logits** and applies `log_softmax` internally, which is more numerically stable than softmax followed by log. Adding softmax yourself would apply it twice and train badly. For predictions, `argmax` of the logits gives the same class as `argmax` of the probabilities, so softmax isn't needed there either.
+- **Loss of an untrained model ≈ 2.3:** random small weights give near-equal logits, so softmax gives about 1/10 probability to every class. Cross-entropy is −ln(p of the true class) = −ln(0.1) = **2.303**. So 2.3 means "guessing uniformly over 10 classes"; a starting loss far from this suggests a bug.
+- **`state_dict`** is an ordered dictionary of parameter name → tensor (e.g. `1.weight` → shape [256, 784]). It holds **only the numbers, not the code or architecture**. So `infer.py` must first build the identical model with `build_model()` and then `load_state_dict()` into it. The names and shapes must match exactly, or loading fails.
+
+### Infra observation
+- **At ~4s/epoch the GPU is not the bottleneck; data loading is.** Each epoch the GPU does ~50k × 203k × 2 ≈ 20 GFLOPs forward (×3 with backward), which should take milliseconds. The time goes to the CPU: `ToTensor()` converts each image from PIL individually, in the main process (`num_workers=0`), and each small batch is copied to the GPU separately. The GPU is mostly idle, waiting for data.
+- **How I'd confirm it:** time only the data loop (iterate the `DataLoader` without the model) and compare with the full epoch; watch `nvidia-smi` for low GPU utilization; or use `torch.profiler`.
+- **What I'd try to speed it up:** `num_workers=2–4` (parallel loading; needs the `if __name__ == "__main__"` guard on Windows), `pin_memory=True` for faster CPU→GPU copies, a larger batch size, or preloading the whole dataset onto the GPU as one tensor (it's only ~180 MB).
