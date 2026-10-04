@@ -6,8 +6,8 @@
 - [x] Tokenize text with `tiktoken`; compare tokens per word on English, code, and another language
 - [x] Batch variable-length sequences: padding + attention mask; measure the padding waste (%)
 - [x] `nn.Embedding` lookup; cosine similarity between a few sentence embeddings
-- [ ] Scaled dot-product attention by hand, with a causal mask; `torch.allclose` against `F.scaled_dot_product_attention`
-- [ ] Multi-head: reshape to (B, heads, T, d_head) and back
+- [x] Scaled dot-product attention by hand, with a causal mask; `torch.allclose` against `F.scaled_dot_product_attention`
+- [x] Multi-head: reshape to (B, heads, T, d_head) and back
 
 ## Day 4: Text → tokens → padded batch → embeddings (`tokenize_embed.py`)
 
@@ -64,3 +64,48 @@
 - **Broadcasting:** shapes line up from the right, and size-1 axes stretch to match. `(B, T, D) * (B, T, 1)` works; `(B, T, D) * (B, T)` doesn't. Hence `unsqueeze(-1)` in `mean_pool` and `keepdim=True` in the cosine norm.
 - **Masks do math too:** multiplying by a 0/1 mask zeros out padding before a sum (Day 3 used masks to *select*; today they *weight*).
 - **All-pairs similarity = one matrix multiply:** normalize the rows, then `normed @ normed.T` → `(N, N)`. Attention's `Q @ K.T` (Day 5) is the same shape of computation.
+
+## Day 5: Attention from scratch (`attention.py`)
+
+```
+x (B,T,D) ─► q,k,v = Linear(x) ─► split_heads (B,H,T,d) ─► softmax(q·kᵀ/√d [+causal mask]) · v ─► merge_heads (B,T,D) ─► out_proj
+```
+
+### A. Scaled dot-product attention
+- `scores = q @ k.transpose(-2,-1) / √d` → `(…, T, T)`: every token's query compared with every token's key.
+- `softmax(dim=-1)`: each row turns into one token's distribution over the tokens it looks at (rows sum to 1).
+- `out = weights @ v`: each token's output is a **weighted average of the value vectors**. In the hand example, token 2 `[1,1]` weights `[.25,.25,.5]` → output `[5,5]`.
+- **Why √d:** a dot product of d random numbers has a spread of about √d. Without the scaling, a large d makes softmax nearly one-hot, and gradients vanish. T doesn't affect the spread of a single score, so the scaling uses d, not T.
+- **Causal mask:** `triu(ones, diagonal=1)` marks the future, and `masked_fill(-inf)` makes `exp(-inf)=0`, so token i only sees tokens 0..i. Zeros above the diagonal; the first row is `[1, 0, 0, …]`.
+- Matches `F.scaled_dot_product_attention` both with and without the causal mask (max diff ~1e-7).
+
+### B. The picture
+![attention](attention.png)
+- Full (encoder/BERT-style): every token can see every token. Causal (GPT-style): a lower triangle. "The" can only see itself.
+- Identical vectors ("The" / "the") attend strongly to each other: attention is similarity-based lookup.
+
+### C. Multi-head
+- `split_heads`: `view(B,T,H,d_head)` + `transpose(1,2)` → `(B,H,T,d_head)`. Each head gets its own slice of each token's numbers (head 1 = numbers 4..7) and attends independently. The same `attention()` works because it only uses the last two axes.
+- `merge_heads`: `transpose` → `contiguous()` → `view`. `transpose` only changes the *strides* (how memory is read), and `view` needs the data physically in order, so `contiguous()` makes a reordered copy (`reshape` = this, done automatically).
+- `nn.Linear(in, out)` = `x @ W.T + b` on the last axis. q/k/v/out projections = 4 × (16·16+16) = **1,088 params**. These are the learned part; attention itself has no weights.
+- PyTorch stores q/k/v as one stacked `(3D, D)` `in_proj_weight` (a **fused QKV** projection: one big matmul beats three small ones on a GPU). Copied my weights into it and got **matches `nn.MultiheadAttention`: True** (causal and not).
+
+### D. Infra: cost vs sequence length (GPU, fp16, B=1, 8 heads, d_head=64)
+| T | scores (H,T,T) | mine: ms | mine: extra MB | F.sdpa: ms | F.sdpa: extra MB |
+|---|---|---|---|---|---|
+| 512 | 4 MB | 0.29 | 9 | 0.06 | 1 |
+| 1,024 | 17 MB | 1.07 | 36 | 0.13 | 1 |
+| 2,048 | 67 MB | 6.37 | 141 | 0.50 | 2 |
+| 4,096 | 268 MB | 18.89 | 558 | 1.41 | 4 |
+| 8,192 | 1,074 MB | 68.45 | **2,223** | 4.85 | **8** |
+
+- **Memory is quadratic in T:** double T → scores 4× (T appears twice in `(T, T)`). q/k/v only grow 2×.
+- **Mine uses about 2× the scores size:** `scores`, the masked copy, and the softmax weights are each a full `(H,T,T)` tensor that's alive at the same time.
+- **F.sdpa (FlashAttention-style) never materializes the T×T matrix.** It works on tiles in on-chip SRAM with an online softmax. That's **278× less memory and 14× faster at 8k**, with memory growing only linearly. Same math, different memory traffic: attention is memory-bound, not compute-bound.
+- At scale: 1 GB of scores × 32 layers × a batch of users → long context is impossible without fused kernels. That's why FlashAttention, and why the KV cache size matters for serving (Day 8).
+
+### PyTorch concepts that clicked today
+- `transpose(-2, -1)` swaps the last two axes, whatever comes before them (works for `(T,d)`, `(B,T,d)`, `(B,H,T,d)`).
+- `view` vs `reshape` vs `contiguous`: same numbers regrouped, but `view` requires contiguous memory.
+- Trailing `_` = in-place (`copy_`, `masked_fill_`). Editing parameters needs `torch.no_grad()`.
+- GPU timing: warm up, `torch.cuda.synchronize()` before starting and stopping the clock (the GPU runs async), and `max_memory_allocated` for the peak.
