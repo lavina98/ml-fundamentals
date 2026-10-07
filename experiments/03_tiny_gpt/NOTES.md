@@ -6,7 +6,7 @@
 - [x] Data: character vocab, train/val split, random (B, T) batches
 - [x] Model: embeddings + N transformer blocks (reuse your attention from 02) + LM head
 - [x] Train on the RTX 3050; log train/val loss; save a checkpoint (5,000 steps, 4.6 min)
-- [ ] `generate.py`: load the checkpoint and sample autoregressively (greedy + temperature)
+- [x] `generate.py`: load the checkpoint and sample autoregressively (greedy + temperature)
 - [x] Record: param count, tokens/sec during training, peak GPU memory
 
 
@@ -86,3 +86,57 @@ text ─► char ids (1-D, 1.1M) ─► get_batch: x, y (B, T) ─► tok_emb + 
 ### New this day
 - `clip_grad_norm_(params, 1.0)`: after backward, before step; caps the total gradient length so one bad batch can't blow up the weights.
 - `estimate_loss`: `eval()` → average 20 batches per split under `no_grad` → `train()`. My bugs: `[]` vs `{}`, `A and B` (returns B, doesn't combine), `for i in 20` (needs `range`), passing `i` as the batch size (a silent bug).
+
+## Day 8: Generation (`generate.py`)
+
+```
+idx (B, T) ─► crop to the last 128 ─► model ─► logits (B, T, 65) ─► [:, -1, :] (B, 65) ─► pick_next (B, 1) ─► cat(dim=1) ─► (B, T+1) ─► repeat
+```
+- **Autoregressive:** predict one token, append it, feed it back in. Same model and weights as training; no `y`, loss = None, only the **last** position's logits are used.
+- `idx[:, -128:]` = **the context window**: `pos_emb` has 128 rows, so older text is forgotten.
+- `pick_next`: greedy = `argmax(dim=-1, keepdim=True)`; sampling = `softmax(logits / temp)` → `multinomial(probs, 1)` (a weighted dice roll per row → `(B, 1)`).
+- **B = independent texts generated in parallel.** Attention mixes along T (within a row), never across B.
+
+### A. Untrained vs trained (temp 1.0, same seed)
+- Untrained: uniform random characters (`PuD?&!IRnhe3CTe…`).
+- Trained (val 1.49): the play's format (`Second Senator:` + newline), real words, plausible rhythm, invented words (`agine`, `lovelows`), no meaning. A character-level model learns spelling and form before sense.
+
+### B. Temperature
+| temp | P(next char) after "…yonder w" (top 3) |
+|---|---|
+| 0.5 | i 0.68 · e 0.16 · a 0.12 |
+| 1.0 | i 0.44 · e 0.21 · a 0.19 |
+| 1.5 | i 0.34 · e 0.21 · a 0.19 |
+
+- `logits / temp` before the softmax: t < 1 sharpens, t > 1 flattens; the ranking never changes.
+- **Greedy loops:** "of the state of the state of the state…". Deterministic + the same context → the same choice → a cycle. The most likely next token ≠ the most likely text. (My prediction was "greedy = the best text": wrong.)
+- 0.5 = safe/repetitive, 1.0 = the model's real distribution, 1.5 = invented words. Same `temperature` knob as LLM APIs.
+
+### C. Infra: cost per token vs context (no KV cache)
+| device | context | ms / token | wasted positions |
+|---|---|---|---|
+| GPU | 1–50 | 1.24 | 96% |
+| GPU | 128 | 1.23 | 99% |
+| CPU | 1–50 | 3.30 | 96% |
+| CPU | 128 | 5.26 | 99% |
+
+- **GPU: flat.** A 3.2M-param model is **overhead-bound**: each step launches ~100 tiny kernels, and that fixed cost dwarfs the math for 128 positions. **CPU: grows 1.6×** because it actually does the extra compute.
+- **99% waste:** at context 128, 128 positions are computed to use 1. Old tokens' keys/values never change → a **KV cache** stores them and each step processes 1 new position. For a 7B model (compute-bound), this is the difference between usable and unusable.
+
+### D. Infra: batched generation (GPU, 100 tokens each)
+| users (B) | ms / step | tokens/sec | vs B=1 |
+|---|---|---|---|
+| 1 | 1.25 | 803 | 1× |
+| 8 | 1.60 | 4,998 | 6× |
+| 32 | 4.17 | 7,667 | 10× |
+| 128 | 14.35 | 8,921 | 11× |
+| 256 | 27.63 | 9,265 | 12× |
+
+- **Up to ~8 users: almost free** (the GPU was idle). Beyond ~32 the GPU is **saturated**: ms/step doubles when B doubles, and throughput plateaus at ~9k tok/s, **12×, not 256×**.
+- **Latency vs throughput trade-off:** at B=256, each user waits 27.6 ms per token (22× slower) while the server produces 12× more total. Serving = picking the batch size that meets a latency SLO at max throughput. That's why vLLM/TGI do **continuous batching**.
+- Without a KV cache, every user recomputes up to 128 positions per step, so the ceiling is lower than it needs to be.
+
+### Transformers vs RNNs (my question)
+- The win is **training**: all T positions in one pass (the causal mask), vs an RNN's sequential `h_t = f(h_{t-1}, x_t)`. Plus direct long-range attention vs squeezing everything into one hidden vector.
+- `pos_emb` is the *cost* of parallelism (attention has no order), not its cause.
+- Generation is sequential for both; a transformer's per-token cost and KV memory grow with context, while an RNN's are constant. Hence Mamba/RWKV/SSMs.
