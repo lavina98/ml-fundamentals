@@ -6,8 +6,8 @@ A 2-week sprint of hands-on PyTorch experiments covering the ML fundamentals ML 
 
 | # | Experiment | Days | Status |
 |---|---|---|---|
-| 01 | [Training loop](experiments/01_training_loop/): gradient descent, FashionMNIST train/infer, overfitting | 1–3 | 🟡 in progress |
-| 02 | [Transformer building blocks](experiments/02_transformer_building_blocks/): tokenization, embeddings, attention from scratch | 4–5 | ⬜ |
+| 01 | [Training loop](experiments/01_training_loop/): gradient descent, FashionMNIST train/infer, overfitting | 1–3 | ✅ |
+| 02 | [Transformer building blocks](experiments/02_transformer_building_blocks/): tokenization, embeddings, attention from scratch | 4–5 | ✅ |
 | 03 | [Tiny GPT](experiments/03_tiny_gpt/): character-level transformer trained on Tiny Shakespeare | 6–8 | ✅ |
 | 04 | [Inference benchmark](experiments/04_inference_benchmark/): batch size, CPU vs GPU, fp32 vs bf16, memory | 9–11 | ⬜ |
 
