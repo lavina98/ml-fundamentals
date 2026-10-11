@@ -7,7 +7,7 @@
 - [x] Batch size sweep (1 → OOM): latency/batch, samples/sec, peak memory (`torch.cuda.max_memory_allocated`)
 - [x] CPU vs GPU at each batch size
 - [x] fp32 vs TF32 vs bf16/fp16 (`torch.autocast` and converted weights)
-- [ ] Generation: time-to-first-token vs per-token latency for the tiny GPT
+- [x] Generation: time-to-first-token vs per-token latency, with and without the KV cache (GPT-2)
 - [x] Charts: throughput vs batch size, latency vs batch size
 
 
@@ -77,4 +77,52 @@ bf16 = fp32's range with fewer digits. fp16 = more digits, but it overflows (700
 - **🧩 The same loss, but ~11.5% of the top-1 tokens flip in bf16.** GPT-2's logits are about -100, where bf16 can only represent steps of 0.5. The flipped positions were near-ties (median top-2 gap 0.13 vs 0.94 where they agreed). At a 50/50 position the winner changes but the probabilities barely do, so the loss doesn't move. fp16 (10 mantissa bits, 8× finer steps) flips only 1.8%; its range limit doesn't matter for logits around 100.
 - **Infra takeaway:** lower precision ≠ bit-identical outputs. Greedy text *will* differ after a precision/GPU change, which is expected, not a bug. Judge quality with aggregate metrics (loss / eval scores), not exact-match. Quantization (int8/int4) is the same trade pushed further.
 - Measurement lesson: the first run said **100% top-1 everywhere**, because the script ran before the `out_top` fix was saved (it compared ref with ref). A result that looks too perfect → suspect the measurement first.
+
+
+## Day 11: Generation latency on GPT-2 (`latency.py`)
+
+Two phases. **Prefill** = the whole prompt in one forward pass, which builds the KV cache → **TTFT** (time to first token). **Decode** = feed only the newest token and reuse the cache → **ms per token**. Batch 1, fp32, RTX 3050, unless stated otherwise.
+
+![latency](latency.png)
+
+### Prefill: TTFT vs prompt length
+| prompt | TTFT ms | ms / prompt token | KV cache MB |
+|---|---|---|---|
+| 64 | 6.8 | 0.107 | 4.7 |
+| 128 | 11.8 | 0.092 | 9.4 |
+| 256 | 17.6 | 0.069 | 18.9 |
+| 512 | 35.2 | 0.069 | 37.7 |
+| 1024 | 73.0 | 0.071 | 75.5 |
+
+### Decode: cost per new token (64-token prompt + 960 new tokens)
+| context | with KV cache | no cache | cache is |
+|---|---|---|---|
+| 64–128 | 4.88 ms | 9.23 ms | 1.9× |
+| 256–320 | 4.46 ms | 21.87 ms | 4.9× |
+| 512–576 | 4.93 ms | 39.21 ms | 8.0× |
+| 960–1024 | 6.16 ms | 71.40 ms | 11.6× |
+
+960 tokens: **5.2 s with the cache vs 38.1 s without (7.3×)**. All 960 greedy tokens were identical.
+
+### Decode speedups: precision × batch (KV cache, 128-token prompt)
+| | batch 1 | batch 8 | batch 32 |
+|---|---|---|---|
+| fp32 ms/step | 5.07 | 8.84 | 21.02 |
+| bf16 ms/step | 4.88 | 5.02 | 9.84 |
+| bf16 speedup | 1.04× | 1.76× | 2.14× |
+| bf16 tokens/s | 205 | 1,592 | 3,252 |
+
+### What I learned
+- **Prefill is parallel across tokens and sequential across layers.** 1024 tokens is still one pass through 12 layers, just with bigger matmuls. TTFT went up **10.7× for 16× the tokens**: below ~256 tokens the fixed per-pass cost (reading the weights, launching kernels) dominates, and above that it is linear. Training works the same way (teacher forcing: the whole known window in one pass).
+- **Without a cache, every decode step is a full prefill.** 71 ms at context 1000 ≈ the 1024-token TTFT, so total cost grows quadratically. With the cache, each step is ~flat (4.9 → 6.2 ms; the small rise is attention reading a longer cache).
+- **The KV cache is exact, not an approximation.** Old tokens' K/V never change because of the causal mask, so cached and uncached output are identical.
+- **🎯 The KV cache is what limits users per GPU:** 74 KB/token in fp32, so 32 users × 1024 tokens = **2.4 GB, 5× the 498 MB of weights**. That's why PagedAttention (vLLM), grouped-query attention and KV-cache quantization exist.
+- **🧩 bf16 didn't speed up batch-1 decode (1.04×).** The step takes 5 ms but reading the weights only needs ~2.2 ms, so the GPU spends most of the step waiting for the CPU to launch hundreds of tiny kernels: decode is **overhead-bound**. Evidence: bf16 batch 8 (5.02 ms) ≈ batch 1, so 8× the tokens came free. bf16 only pays off once the batch makes the GPU the bottleneck (2.14× at batch 32). Amdahl again. Fixes: CUDA graphs (replay all launches with one call), torch.compile (kernel fusion), and continuous batching.
+- Measurement trap: batch-1 decode is so light that the GPU stays in a low-clock power state, and the first ~100 steps ran ~2× slower. It needed a long warm-up.
+
+## Experiment 04 summary
+1. **Prefill is compute-bound; decode is overhead/memory-bound.** Servers schedule them differently (chunked prefill, disaggregated serving).
+2. **Batching is free throughput until the GPU is full.** Pick the batch from the latency SLO (Day 9's knee).
+3. **bf16 = 2.5× faster prefill, half the memory, the same loss**, but outputs are not bit-identical, and it doesn't help decode until you batch.
+4. **The KV cache turns decode from quadratic into ~flat, and its memory is what limits concurrent users.**
 
