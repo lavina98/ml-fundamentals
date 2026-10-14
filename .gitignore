@@ -5,3 +5,4 @@ checkpoints/
 *.pt
 *.pth
 .ipynb_checkpoints/
+job-research/

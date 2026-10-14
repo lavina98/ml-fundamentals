@@ -27,8 +27,8 @@ All numbers were measured on one RTX 3050 (8 GB). GPT-2 small (124M) for experim
 
 Also: a from-scratch 3.2M-param GPT trains at **157k tokens/s** here; at that rate GPT-3's training run would take **~3,000 years**, which is the case for clusters and distributed training ([03 · Day 7](experiments/03_tiny_gpt/NOTES.md)). Removing `zero_grad()` or `loss.backward()` raises **no error**: the model silently trains wrong or not at all ([01 · Day 1](experiments/01_training_loop/NOTES.md)).
 
-## Job market research
-[`job-research/`](job-research/) tracks 28 ML infrastructure job descriptions (`jds.csv`) with a tally script. The [requirements map](job-research/requirements_map.md) marks which recurring skills these experiments cover, which are covered by prior platform experience, and which gaps come next (model serving, profiling, quantization).
+## What's next
+The skills that come up most in ML infrastructure job descriptions and aren't covered here yet: **model serving** (vLLM, a batching server, load-tested on Kubernetes), **profiling** (`torch.profiler`, Nsight Systems, CUDA graphs), and **quantization** (int8/int4).
 
 ## Setup
 
